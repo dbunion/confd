@@ -41,25 +41,29 @@ type TemplateResourceConfig struct {
 
 // TemplateResource is the representation of a parsed template resource.
 type TemplateResource struct {
-	CheckCmd      string `toml:"check_cmd"`
-	Dest          string
-	FileMode      os.FileMode
-	Gid           int
-	Keys          []string
-	Mode          string
-	Prefix        string
-	ReloadCmd     string `toml:"reload_cmd"`
-	Src           string
-	StageFile     *os.File
-	Uid           int
-	funcMap       map[string]interface{}
-	lastIndex     uint64
-	keepStageFile bool
-	noop          bool
-	store         memkv.Store
-	storeClient   backends.StoreClient
-	syncOnly      bool
-	PGPPrivateKey []byte
+	CheckCmd       string `toml:"check_cmd"`
+	Dest           string
+	BatchDest      bool   `toml:"batch_dst"`
+	DestPrefixKey  string `toml:"dest_prefix_key"`
+	FileMode       os.FileMode
+	Gid            int
+	Keys           []string
+	Mode           string
+	Prefix         string
+	ReloadCmd      string `toml:"reload_cmd"`
+	Src            string
+	StageFile      *os.File
+	BatchStageFile []*os.File
+	BatchFiles     []string
+	Uid            int
+	funcMap        map[string]interface{}
+	lastIndex      uint64
+	keepStageFile  bool
+	noop           bool
+	store          memkv.Store
+	storeClient    backends.StoreClient
+	syncOnly       bool
+	PGPPrivateKey  []byte
 }
 
 var ErrEmptySrc = errors.New("empty src template")
@@ -209,24 +213,66 @@ func (t *TemplateResource) createStageFile() error {
 		return fmt.Errorf("Unable to process template %s, %s", t.Src, err)
 	}
 
-	// create TempFile in Dest directory to avoid cross-filesystem issues
-	temp, err := ioutil.TempFile(filepath.Dir(t.Dest), "."+filepath.Base(t.Dest))
-	if err != nil {
-		return err
-	}
+	if !t.BatchDest {
+		// create TempFile in Dest directory to avoid cross-filesystem issues
+		temp, err := ioutil.TempFile(filepath.Dir(t.Dest), "."+filepath.Base(t.Dest))
+		if err != nil {
+			return err
+		}
 
-	if err = tmpl.Execute(temp, nil); err != nil {
-		temp.Close()
-		os.Remove(temp.Name())
-		return err
-	}
-	defer temp.Close()
+		if err = tmpl.Execute(temp, nil); err != nil {
+			temp.Close()
+			os.Remove(temp.Name())
+			return err
+		}
+		defer temp.Close()
 
-	// Set the owner, group, and mode on the stage file now to make it easier to
-	// compare against the destination configuration file later.
-	os.Chmod(temp.Name(), t.FileMode)
-	os.Chown(temp.Name(), t.Uid, t.Gid)
-	t.StageFile = temp
+		// Set the owner, group, and mode on the stage file now to make it easier to
+		// compare against the destination configuration file later.
+		os.Chmod(temp.Name(), t.FileMode)
+		os.Chown(temp.Name(), t.Uid, t.Gid)
+		t.StageFile = temp
+	} else {
+		t.BatchStageFile = make([]*os.File, 0)
+		t.BatchFiles = make([]string, 0)
+
+		keys, err := t.storeClient.GetValues([]string{t.Prefix + t.DestPrefixKey})
+		if err != nil {
+			return err
+		}
+
+		tmpFileFunc := func(fileName string, fileContnet string) error {
+			// create TempFile in Dest directory to avoid cross-filesystem issues
+			temp, err := ioutil.TempFile(filepath.Dir(t.Dest), "."+fileName)
+			if err != nil {
+				return err
+			}
+
+			if err = tmpl.Execute(temp, map[string]string{"Value": fileContnet}); err != nil {
+				temp.Close()
+				os.Remove(temp.Name())
+				return err
+			}
+
+			defer temp.Close()
+
+			// Set the owner, group, and mode on the stage file now to make it easier to
+			// compare against the destination configuration file later.
+			os.Chmod(temp.Name(), t.FileMode)
+			os.Chown(temp.Name(), t.Uid, t.Gid)
+			t.BatchStageFile = append(t.BatchStageFile, temp)
+			t.BatchFiles = append(t.BatchFiles, fileName)
+			return nil
+		}
+
+		for key, value := range keys {
+			name := filepath.Base(key)
+
+			if err := tmpFileFunc(name, value); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -236,60 +282,84 @@ func (t *TemplateResource) createStageFile() error {
 // if set to have the application or service pick up the changes.
 // It returns an error if any.
 func (t *TemplateResource) sync() error {
-	staged := t.StageFile.Name()
-	if t.keepStageFile {
-		log.Info("Keeping staged file: " + staged)
-	} else {
-		defer os.Remove(staged)
-	}
-
-	log.Debug("Comparing candidate config to " + t.Dest)
-	ok, err := util.IsConfigChanged(staged, t.Dest)
-	if err != nil {
-		log.Error(err.Error())
-	}
-	if t.noop {
-		log.Warning("Noop mode enabled. " + t.Dest + " will not be modified")
-		return nil
-	}
-	if ok {
-		log.Info("Target config " + t.Dest + " out of sync")
-		if !t.syncOnly && t.CheckCmd != "" {
-			if err := t.check(); err != nil {
-				return errors.New("Config check failed: " + err.Error())
-			}
+	syncFunc := func(tmpName, realName string, batch bool) error {
+		staged := tmpName
+		if t.keepStageFile {
+			log.Info("Keeping staged file: " + staged)
+		} else {
+			defer os.Remove(staged)
 		}
-		log.Debug("Overwriting target config " + t.Dest)
-		err := os.Rename(staged, t.Dest)
+
+		dst := t.Dest
+		if batch {
+			dst = fmt.Sprintf(t.Dest, realName)
+		}
+		log.Debug("Comparing candidate config to " + dst)
+		ok, err := util.IsConfigChanged(staged, dst)
 		if err != nil {
-			if strings.Contains(err.Error(), "device or resource busy") {
-				log.Debug("Rename failed - target is likely a mount. Trying to write instead")
-				// try to open the file and write to it
-				var contents []byte
-				var rerr error
-				contents, rerr = ioutil.ReadFile(staged)
-				if rerr != nil {
-					return rerr
+			log.Error(err.Error())
+		}
+
+		if t.noop {
+			log.Warning("Noop mode enabled. " + dst + " will not be modified")
+			return nil
+		}
+
+		if ok {
+			log.Info("Target config " + dst + " out of sync")
+			if !t.syncOnly && t.CheckCmd != "" {
+				if err := t.check(); err != nil {
+					return errors.New("Config check failed: " + err.Error())
 				}
-				err := ioutil.WriteFile(t.Dest, contents, t.FileMode)
-				// make sure owner and group match the temp file, in case the file was created with WriteFile
-				os.Chown(t.Dest, t.Uid, t.Gid)
-				if err != nil {
+			}
+			log.Debug("Overwriting target config " + dst)
+			err := os.Rename(staged, dst)
+			if err != nil {
+				if strings.Contains(err.Error(), "device or resource busy") {
+					log.Debug("Rename failed - target is likely a mount. Trying to write instead")
+					// try to open the file and write to it
+					var contents []byte
+					var rerr error
+					contents, rerr = ioutil.ReadFile(staged)
+					if rerr != nil {
+						return rerr
+					}
+					err := ioutil.WriteFile(dst, contents, t.FileMode)
+					// make sure owner and group match the temp file, in case the file was created with WriteFile
+					os.Chown(dst, t.Uid, t.Gid)
+					if err != nil {
+						return err
+					}
+				} else {
 					return err
 				}
-			} else {
-				return err
 			}
-		}
-		if !t.syncOnly && t.ReloadCmd != "" {
-			if err := t.reload(); err != nil {
-				return err
+			if !t.syncOnly && t.ReloadCmd != "" {
+				if err := t.reload(); err != nil {
+					return err
+				}
 			}
+			log.Info("Target config " + dst + " has been updated")
+		} else {
+			log.Debug("Target config " + dst + " in sync")
 		}
-		log.Info("Target config " + t.Dest + " has been updated")
-	} else {
-		log.Debug("Target config " + t.Dest + " in sync")
+		return nil
 	}
+
+	if !t.BatchDest {
+		return syncFunc(t.StageFile.Name(), "",false)
+	}
+
+	// process batch dest
+	for i := 0; i < len(t.BatchStageFile); i++ {
+		tmpName := t.BatchStageFile[i].Name()
+		realName := t.BatchFiles[i]
+
+		if err := syncFunc(tmpName, realName, true); err != nil {
+			log.Warning("batch stage file " + realName + "sync error, err:%v", err)
+		}
+	}
+
 	return nil
 }
 
